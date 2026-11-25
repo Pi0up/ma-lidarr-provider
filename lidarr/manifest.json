@@ -1,0 +1,12 @@
+{
+  "type": "music",
+  "domain": "lidarr",
+  "stage": "alpha",
+  "name": "Lidarr",
+  "description": "Search and request missing artists and albums in Lidarr directly from Music Assistant.",
+  "codeowners": ["@vincent"],
+  "provides": ["artist", "album"],
+  "requirements": [],
+  "documentation": "https://github.com/vincent/ma-lidarr-provider#readme",
+  "multi_instance": false
+}

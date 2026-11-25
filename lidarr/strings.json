@@ -1,0 +1,6 @@
+{
+  "manifest": {
+    "name": "Lidarr",
+    "description": "Search and request missing artists and albums in Lidarr directly from Music Assistant."
+  }
+}
