@@ -7,4 +7,6 @@ __pycache__/
 .coverage
 # the data of the server that `scripts/run.sh` starts
 .data/
+ma-data/
+.env
 .DS_Store

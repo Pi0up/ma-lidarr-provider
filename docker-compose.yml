@@ -1,0 +1,29 @@
+services:
+  music-assistant-server:
+    image: ghcr.io/music-assistant/server:${MA_IMAGE_TAG:-latest}
+    container_name: music-assistant-server
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      # Required so Music Assistant enables --dev-providers-dir for custom local providers
+      - PYTHONDEVMODE=1
+      - TZ=${TZ:-Europe/Paris}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    command:
+      - --data-dir
+      - /data
+      - --dev-providers-dir
+      - /custom_providers
+    volumes:
+      # Persistent Music Assistant database, settings and cache
+      - ${MA_DATA_DIR:-./ma-data}:/data
+      # Mount this repository (contains lidarr/manifest.json) read-only
+      - .:/custom_providers:ro
+      # Optional: mount your local music folder managed by Lidarr
+      # - ${MUSIC_DIR:-/mnt/music}:/media:ro
+    # Optional: uncomment if you mount SMB/NFS shares directly from Music Assistant
+    # cap_add:
+    #   - SYS_ADMIN
+    #   - DAC_READ_SEARCH
+    # security_opt:
+    #   - apparmor:unconfined
