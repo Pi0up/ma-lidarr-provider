@@ -35,6 +35,7 @@ class FakeLidarrState:
         self.added_artists: list[dict[str, Any]] = []
         self.updated_artists: list[dict[str, Any]] = []
         self.queue_records: list[dict[str, Any]] = []
+        self.deleted_queue_ids: list[int] = []
         self.missing_records: list[dict[str, Any]] = []
         self.history_records: list[dict[str, Any]] = []
 
@@ -135,11 +136,32 @@ class _FakeLidarrHandlers:
             return web.json_response(matches)
         return web.json_response(self.state.artists)
 
+    async def get_artist_by_id(self, request: web.Request) -> web.Response:
+        artist_id = int(request.match_info["id"])
+        for artist in self.state.artists:
+            if artist.get("id") == artist_id:
+                return web.json_response(artist)
+        return web.json_response({"message": "Not found"}, status=404)
+
     async def add_artist(self, request: web.Request) -> web.Response:
         payload = await request.json()
-        payload["id"] = len(self.state.artists) + 10
+        artist_id = len(self.state.artists) + 10
+        payload["id"] = artist_id
         self.state.artists.append(payload)
         self.state.added_artists.append(payload)
+        # Mimic Lidarr's post-add refresh populating the artist's albums unmonitored.
+        if payload.get("foreignArtistId") == ARTIST_MBID and not any(
+            a.get("foreignAlbumId") == ALBUM_MBID for a in self.state.albums
+        ):
+            self.state.albums.append(
+                {
+                    "id": 100 + artist_id,
+                    "artistId": artist_id,
+                    "foreignAlbumId": ALBUM_MBID,
+                    "title": "Discovery",
+                    "monitored": False,
+                }
+            )
         return web.json_response(payload, status=201)
 
     async def update_artist(self, request: web.Request) -> web.Response:
@@ -176,6 +198,12 @@ class _FakeLidarrHandlers:
     async def queue(self, _request: web.Request) -> web.Response:
         return web.json_response({"records": self.state.queue_records})
 
+    async def delete_queue(self, request: web.Request) -> web.Response:
+        queue_id = int(request.match_info["id"])
+        self.state.deleted_queue_ids.append(queue_id)
+        self.state.queue_records = [r for r in self.state.queue_records if r.get("id") != queue_id]
+        return web.Response(status=204)
+
     async def wanted_missing(self, _request: web.Request) -> web.Response:
         return web.json_response({"records": self.state.missing_records})
 
@@ -211,12 +239,14 @@ def build_fake_lidarr_app(state: FakeLidarrState) -> web.Application:
     app.router.add_get("/api/v1/artist/lookup", handlers.artist_lookup)
     app.router.add_get("/api/v1/album/lookup", handlers.album_lookup)
     app.router.add_get("/api/v1/artist", handlers.get_artists)
+    app.router.add_get("/api/v1/artist/{id}", handlers.get_artist_by_id)
     app.router.add_post("/api/v1/artist", handlers.add_artist)
     app.router.add_put("/api/v1/artist/{id}", handlers.update_artist)
     app.router.add_get("/api/v1/album", handlers.get_albums)
     app.router.add_put("/api/v1/album/monitor", handlers.monitor_albums)
     app.router.add_post("/api/v1/command", handlers.command)
     app.router.add_get("/api/v1/queue", handlers.queue)
+    app.router.add_delete("/api/v1/queue/{id}", handlers.delete_queue)
     app.router.add_get("/api/v1/wanted/missing", handlers.wanted_missing)
     app.router.add_get("/api/v1/history", handlers.history)
     return app
@@ -254,8 +284,11 @@ async def test_request_album_adds_new_artist_with_single_album(aiohttp_server: A
     assert added["addOptions"] == {
         "monitor": "none",
         "albumsToMonitor": [ALBUM_MBID],
-        "searchForMissingAlbums": True,
+        "searchForMissingAlbums": False,
     }
+    # After artist refresh populates the album, the client explicitly monitors it and searches.
+    assert state.monitored_calls == [{"albumIds": [110], "monitored": True}]
+    assert state.commands == [{"name": "AlbumSearch", "albumIds": [110]}]
 
 
 async def test_request_album_existing_unmonitored_triggers_search(aiohttp_server: Any) -> None:
@@ -326,3 +359,32 @@ async def test_request_unknown_album_raises_not_found(aiohttp_server: Any) -> No
         client = LidarrClient(session, str(server.make_url("/")), API_KEY, rate_limit_delay=0)
         with pytest.raises(LidarrNotFoundError):
             await client.request_album("99999999-9999-9999-9999-999999999999", options)
+
+
+async def test_cancel_album_request_unmonitors_and_removes_queue(aiohttp_server: Any) -> None:
+    """Cancelling an album request unmonitors it and deletes its active queue entry."""
+    state = FakeLidarrState()
+    state.albums.append(
+        {
+            "id": 42,
+            "artistId": 10,
+            "foreignAlbumId": ALBUM_MBID,
+            "title": "Discovery",
+            "monitored": True,
+        }
+    )
+    state.queue_records.append(
+        {
+            "id": 77,
+            "status": "downloading",
+            "album": {"foreignAlbumId": ALBUM_MBID, "title": "Discovery"},
+        }
+    )
+    server: TestServer = await aiohttp_server(build_fake_lidarr_app(state))
+    async with aiohttp.ClientSession() as session:
+        client = LidarrClient(session, str(server.make_url("/")), API_KEY, rate_limit_delay=0)
+        cancelled = await client.cancel_album_request(ALBUM_MBID)
+
+    assert cancelled is True
+    assert state.monitored_calls == [{"albumIds": [42], "monitored": False}]
+    assert state.deleted_queue_ids == [77]

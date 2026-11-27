@@ -181,6 +181,18 @@ class LidarrClient:
         data = await self._request("GET", "/album/lookup", params={"term": term})
         return data if isinstance(data, list) else []
 
+    async def get_artist_by_id(self, artist_id: int) -> dict[str, Any] | None:
+        """
+        Return the existing Lidarr artist by internal Lidarr ID, or None.
+
+        :param artist_id: Internal Lidarr artist ID.
+        """
+        try:
+            data = await self._request("GET", f"/artist/{artist_id}")
+        except LidarrNotFoundError:
+            return None
+        return data if isinstance(data, dict) else None
+
     async def get_artist_by_foreign_id(self, foreign_artist_id: str) -> dict[str, Any] | None:
         """
         Return the existing Lidarr artist matching the given MusicBrainz artist ID, or None.
@@ -345,35 +357,109 @@ class LidarrClient:
             return records if isinstance(records, list) else []
         return []
 
+    async def remove_from_queue(
+        self,
+        queue_id: int,
+        *,
+        remove_from_client: bool = True,
+        blocklist: bool = False,
+    ) -> None:
+        """
+        Remove an active download item from the Lidarr queue.
+
+        :param queue_id: Internal Lidarr queue record ID.
+        :param remove_from_client: Whether to cancel the download in the download client.
+        :param blocklist: Whether to blocklist the release in Lidarr.
+        """
+        await self._request(
+            "DELETE",
+            f"/queue/{queue_id}",
+            params={
+                "removeFromClient": str(remove_from_client).lower(),
+                "blocklist": str(blocklist).lower(),
+            },
+        )
+
+    async def _ensure_artist_monitored(self, artist: dict[str, Any]) -> dict[str, Any]:
+        """Ensure an existing Lidarr artist has ``monitored=True``."""
+        if artist.get("monitored", False):
+            return artist
+        artist_id = int(artist["id"])
+        updated = dict(artist)
+        updated["monitored"] = True
+        return await self.update_artist(artist_id, updated)
+
+    async def _wait_for_album(
+        self,
+        foreign_album_id: str,
+        *,
+        artist_id: int | None = None,
+        timeout: float = 30.0,
+        poll_interval: float = 1.0,
+    ) -> dict[str, Any] | None:
+        """
+        Wait until Lidarr's post-add artist refresh populates the requested album.
+
+        :param foreign_album_id: MusicBrainz release-group UUID.
+        :param artist_id: Optional internal Lidarr artist ID.
+        :param timeout: Maximum seconds to wait.
+        :param poll_interval: Seconds between polls.
+        """
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            albums = await self.get_albums(foreign_album_id=foreign_album_id)
+            if albums:
+                return albums[0]
+            if artist_id is not None:
+                artist_albums = await self.get_albums(artist_id=artist_id)
+                for album in artist_albums:
+                    if album.get("foreignAlbumId") == foreign_album_id:
+                        return album
+            if asyncio.get_running_loop().time() >= deadline:
+                return None
+            await asyncio.sleep(poll_interval)
+
+    async def _monitor_and_search_album(self, album: dict[str, Any]) -> dict[str, Any]:
+        """Ensure an album's artist and the album itself are monitored, then run AlbumSearch."""
+        if album.get("artistId") is not None:
+            existing_artist = await self.get_artist_by_id(int(album["artistId"]))
+            if existing_artist is not None:
+                await self._ensure_artist_monitored(existing_artist)
+        album_id = int(album["id"])
+        if not album.get("monitored", False):
+            await self.set_albums_monitored([album_id], monitored=True)
+        await self.trigger_album_search([album_id])
+        return album
+
     async def request_album(
         self,
         foreign_album_id: str,
         options: LidarrRequestOptions,
+        *,
+        refresh_timeout: float = 30.0,
+        refresh_poll_interval: float = 1.0,
     ) -> dict[str, Any]:
         """
-        Ensure an album is monitored in Lidarr and trigger an immediate AlbumSearch.
+        Ensure an album and its artist are monitored in Lidarr and trigger AlbumSearch.
 
-        If the artist is not yet in Lidarr, the artist is added with ``monitor="none"`` and
-        ``albumsToMonitor=[foreign_album_id]`` so only the requested album is downloaded.
+        If the artist is not yet in Lidarr, the artist is added with ``monitor="none"`` so no
+        other albums are monitored, then once Lidarr finishes indexing the artist's albums, only
+        the requested album is monitored and ``AlbumSearch`` is triggered explicitly.
 
         :param foreign_album_id: MusicBrainz release-group UUID of the album.
         :param options: Lidarr target folder, profiles and tags.
+        :param refresh_timeout: Max seconds to wait for Lidarr to populate a new artist's albums.
+        :param refresh_poll_interval: Polling interval while waiting for Lidarr refresh.
         """
         existing_albums = await self.get_albums(foreign_album_id=foreign_album_id)
         if existing_albums:
-            album = existing_albums[0]
-            album_id = int(album["id"])
-            if not album.get("monitored", False):
-                await self.set_albums_monitored([album_id], monitored=True)
-            await self.trigger_album_search([album_id])
-            return album
+            return await self._monitor_and_search_album(existing_albums[0])
 
         lookup_results = await self.lookup_album(f"lidarr:{foreign_album_id}")
         if not lookup_results:
             raise LidarrNotFoundError(f"Album {foreign_album_id} not found in Lidarr lookup")
 
-        album_meta = lookup_results[0]
-        artist_meta = album_meta.get("artist")
+        artist_meta = lookup_results[0].get("artist")
         foreign_artist_id = (
             artist_meta.get("foreignArtistId") if isinstance(artist_meta, dict) else None
         )
@@ -398,26 +484,69 @@ class LidarrClient:
                     "addOptions": {
                         "monitor": "none",
                         "albumsToMonitor": [foreign_album_id],
-                        "searchForMissingAlbums": True,
+                        "searchForMissingAlbums": False,
                     },
                 }
             )
-            return await self.add_artist(artist_payload)
+            created_artist = await self.add_artist(artist_payload)
+            artist_id = int(created_artist["id"])
+        else:
+            existing_artist = await self._ensure_artist_monitored(existing_artist)
+            artist_id = int(existing_artist["id"])
 
-        # Artist exists in Lidarr; locate the album under this artist, monitor it, and search.
-        artist_albums = await self.get_albums(artist_id=int(existing_artist["id"]))
-        for album in artist_albums:
-            if album.get("foreignAlbumId") == foreign_album_id:
-                album_id = int(album["id"])
-                if not album.get("monitored", False):
-                    await self.set_albums_monitored([album_id], monitored=True)
-                await self.trigger_album_search([album_id])
-                return album
-
-        raise LidarrNotFoundError(
-            f"Album {foreign_album_id} is not available under existing Lidarr artist "
-            f"{existing_artist.get('artistName', foreign_artist_id)}"
+        album_entry = await self._wait_for_album(
+            foreign_album_id,
+            artist_id=artist_id,
+            timeout=refresh_timeout,
+            poll_interval=refresh_poll_interval,
         )
+        if album_entry is None:
+            raise LidarrNotFoundError(
+                f"Album {foreign_album_id} did not appear in Lidarr after adding artist {artist_id}"
+            )
+
+        return await self._monitor_and_search_album(album_entry)
+
+    async def cancel_album_request(self, foreign_album_id: str) -> bool:
+        """
+        Unmonitor a requested album in Lidarr and cancel any active queue download for it.
+
+        :param foreign_album_id: MusicBrainz release-group UUID.
+        """
+        cancelled = False
+        albums = await self.get_albums(foreign_album_id=foreign_album_id)
+        if albums:
+            album_id = int(albums[0]["id"])
+            if albums[0].get("monitored", False):
+                await self.set_albums_monitored([album_id], monitored=False)
+            cancelled = True
+
+        queue_records = await self.get_queue()
+        for record in queue_records:
+            raw_album = record.get("album")
+            if (
+                isinstance(raw_album, dict)
+                and raw_album.get("foreignAlbumId") == foreign_album_id
+                and record.get("id") is not None
+            ):
+                await self.remove_from_queue(int(record["id"]))
+                cancelled = True
+        return cancelled
+
+    async def cancel_artist_request(self, foreign_artist_id: str) -> bool:
+        """
+        Unmonitor a requested artist in Lidarr.
+
+        :param foreign_artist_id: MusicBrainz artist UUID.
+        """
+        existing_artist = await self.get_artist_by_foreign_id(foreign_artist_id)
+        if existing_artist is None:
+            return False
+        if existing_artist.get("monitored", False):
+            updated = dict(existing_artist)
+            updated["monitored"] = False
+            await self.update_artist(int(existing_artist["id"]), updated)
+        return True
 
     async def request_artist(
         self,

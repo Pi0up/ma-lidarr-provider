@@ -36,6 +36,7 @@ from music_assistant_models.media_items import (
     ItemMapping,
     MediaItemType,
     SearchResults,
+    Track,
 )
 
 from music_assistant.controllers.cache import use_cache
@@ -287,6 +288,7 @@ class LidarrProvider(MusicProvider):
     _poll_interval: int
     _poll_task: asyncio.Task[None] | None = None
     _last_import_id: int | None = None
+    _completing_ids: set[str]
 
     def _get_setting(self, key: str) -> ConfigValueType | None:
         """Read a setting from setup_data first, falling back to runtime provider config."""
@@ -303,6 +305,7 @@ class LidarrProvider(MusicProvider):
             raise SetupFailedError("Lidarr URL and API key are required")
 
         self.client = LidarrClient(self.mass.http_session, url, api_key)
+        self._completing_ids = set()
         try:
             await self.client.get_system_status()
         except LidarrAuthError as err:
@@ -449,6 +452,45 @@ class LidarrProvider(MusicProvider):
             if parsed is not None:
                 return parsed
         raise MediaNotFoundError(f"Album {prov_album_id} not found in Lidarr")
+
+    async def get_album_tracks(
+        self,
+        prov_album_id: str,
+        in_library_only: bool = False,  # noqa: FBT001, FBT002
+    ) -> list[Track]:
+        """Return an empty track list for Lidarr request placeholders."""
+        return []
+
+    async def library_remove(self, prov_item_id: str, media_type: MediaType) -> bool:
+        """
+        Cancel a Lidarr download request when the user removes the item from the MA library.
+
+        :param prov_item_id: MusicBrainz album or artist UUID.
+        :param media_type: ``MediaType.ALBUM`` or ``MediaType.ARTIST``.
+        """
+        if prov_item_id in self._completing_ids:
+            return True
+        task_id = f"lidarr_request_{media_type.value}_{prov_item_id}"
+        with contextlib.suppress(Exception):
+            self.mass.tasks.cancel_task(task_id)
+
+        try:
+            if media_type == MediaType.ALBUM:
+                await self.client.cancel_album_request(prov_item_id)
+                self.logger.info("Cancelled Lidarr album request (%s)", prov_item_id)
+                return True
+            if media_type == MediaType.ARTIST:
+                await self.client.cancel_artist_request(prov_item_id)
+                self.logger.info("Cancelled Lidarr artist request (%s)", prov_item_id)
+                return True
+        except LidarrError:
+            self.logger.exception(
+                "Failed to cancel Lidarr %s request (%s)",
+                media_type.value,
+                prov_item_id,
+            )
+            return False
+        return False
 
     async def library_add(self, item: MediaItemType) -> bool:
         """
@@ -782,12 +824,16 @@ class LidarrProvider(MusicProvider):
             for mapping in lib_item.provider_mappings
             if mapping.provider_instance != self.instance_id
         ]
-        if other_mappings:
-            await controller.remove_provider_mappings(lib_item.item_id, self.instance_id)
-            self.logger.info("Removed Lidarr mapping from library item %r", lib_item.name)
-        else:
-            await controller.remove_item_from_library(lib_item.item_id, recursive=False)
-            self.logger.info("Removed completed Lidarr request %r from library", lib_item.name)
+        self._completing_ids.add(item_id)
+        try:
+            if other_mappings:
+                await controller.remove_provider_mappings(lib_item.item_id, self.instance_id)
+                self.logger.info("Removed Lidarr mapping from library item %r", lib_item.name)
+            else:
+                await controller.remove_item_from_library(lib_item.item_id, recursive=False)
+                self.logger.info("Removed completed Lidarr request %r from library", lib_item.name)
+        finally:
+            self._completing_ids.discard(item_id)
 
     async def _poll_imports(self) -> None:
         """Periodically poll Lidarr history and trigger a local MA rescan on new imports."""

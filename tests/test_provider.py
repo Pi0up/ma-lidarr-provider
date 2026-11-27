@@ -124,11 +124,20 @@ async def test_search_and_library_add(mass: MusicAssistant, aiohttp_server: Any)
     assert state.added_artists == []
     assert state.commands == []
 
-    # Adding the album to library requests only that album in Lidarr.
+    # Adding the album to library adds the artist, monitors only that album and triggers search.
     added = await provider.library_add(album)
     assert added is True
     assert len(state.added_artists) == 1
-    assert state.added_artists[0]["addOptions"]["albumsToMonitor"] == [ALBUM_MBID]
+    assert state.monitored_calls == [{"albumIds": [110], "monitored": True}]
+    assert state.commands == [{"name": "AlbumSearch", "albumIds": [110]}]
+
+    # Opening the album in MA must not fail when fetching album tracks.
+    assert await provider.get_album_tracks(album.item_id) == []
+
+    # Removing the album from library cancels the Lidarr request.
+    removed = await provider.library_remove(album.item_id, MediaType.ALBUM)
+    assert removed is True
+    assert state.monitored_calls[-1] == {"albumIds": [110], "monitored": False}
 
 
 async def test_browse_queue_and_missing(mass: MusicAssistant, aiohttp_server: Any) -> None:
