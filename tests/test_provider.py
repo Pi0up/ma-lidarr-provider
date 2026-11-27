@@ -343,3 +343,38 @@ async def test_cleanup_completed_requests_removes_imported_placeholders(
 
     await lidarr_prov._cleanup_completed_requests()  # noqa: SLF001
     mock_remove.assert_awaited_once_with("55", recursive=False)
+
+
+async def test_get_artist_albums_returns_discography(
+    mass: MusicAssistant,
+    aiohttp_server: Any,
+) -> None:
+    """Clicking a Lidarr artist returns their albums with Lidarr Request tags."""
+    state = FakeLidarrState()
+    state.artists.append(
+        {
+            "id": 10,
+            "foreignArtistId": ARTIST_MBID,
+            "artistName": "Daft Punk",
+            "monitored": True,
+        }
+    )
+    state.albums.append(
+        {
+            "id": 42,
+            "artistId": 10,
+            "foreignAlbumId": ALBUM_MBID,
+            "title": "Discovery",
+            "albumType": "Album",
+            "releaseDate": "2001-03-12T00:00:00Z",
+            "monitored": False,
+        }
+    )
+    server: TestServer = await aiohttp_server(build_fake_lidarr_app(state))
+    provider = await _setup_lidarr_provider(mass, server)
+
+    albums = await provider.get_artist_albums(ARTIST_MBID)
+    assert len(albums) == 1
+    assert albums[0].name == "Discovery"
+    assert albums[0].version == "Lidarr Request"
+    assert albums[0].item_id == ALBUM_MBID

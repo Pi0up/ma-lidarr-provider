@@ -86,6 +86,7 @@ if TYPE_CHECKING:
     from music_assistant.models import ProviderInstanceType
 
 SUPPORTED_FEATURES = {
+    ProviderFeature.ARTIST_ALBUMS,
     ProviderFeature.BROWSE,
     ProviderFeature.SEARCH,
     ProviderFeature.LIBRARY_ARTISTS_EDIT,
@@ -432,6 +433,33 @@ class LidarrProvider(MusicProvider):
             if parsed is not None:
                 return parsed
         raise MediaNotFoundError(f"Artist {prov_artist_id} not found in Lidarr")
+
+    @use_cache(3600)
+    async def get_artist_albums(self, prov_artist_id: str) -> list[Album]:
+        """
+        Return all albums for a Lidarr artist by MusicBrainz artist UUID.
+
+        :param prov_artist_id: MusicBrainz artist UUID.
+        """
+        try:
+            raw_albums = await self.client.get_artist_albums(prov_artist_id)
+        except LidarrError as err:
+            self.logger.warning(
+                "Failed to fetch Lidarr albums for artist %s: %s", prov_artist_id, err
+            )
+            return []
+
+        albums: list[Album] = []
+        for raw_album in raw_albums:
+            parsed = parse_album(
+                raw_album,
+                provider_domain=self.domain,
+                provider_instance=self.instance_id,
+                version_tag=self._version_tag,
+            )
+            if parsed is not None:
+                albums.append(parsed)
+        return albums
 
     @use_cache(3600)
     async def get_album(self, prov_album_id: str) -> Album:

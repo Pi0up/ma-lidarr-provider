@@ -181,6 +181,114 @@ class LidarrClient:
         data = await self._request("GET", "/album/lookup", params={"term": term})
         return data if isinstance(data, list) else []
 
+    async def get_artist_albums(self, foreign_artist_id: str) -> list[dict[str, Any]]:
+        """
+        Return albums for an artist, whether already in Lidarr or not yet added.
+
+        If the artist already exists in Lidarr, returns their Lidarr albums directly.
+        Otherwise queries MusicBrainz release-groups for that artist MBID (falling back to
+        Lidarr ``/album/lookup`` filtered by ``foreignArtistId``).
+
+        :param foreign_artist_id: MusicBrainz artist UUID.
+        """
+        existing_artist = await self.get_artist_by_foreign_id(foreign_artist_id)
+        if existing_artist is not None and existing_artist.get("id") is not None:
+            albums = await self.get_albums(artist_id=int(existing_artist["id"]))
+            for album in albums:
+                if "artist" not in album:
+                    album["artist"] = existing_artist
+            return albums
+
+        artist_meta: dict[str, Any] = {"foreignArtistId": foreign_artist_id}
+        try:
+            lookup = await self.lookup_artist(f"lidarr:{foreign_artist_id}")
+            if lookup:
+                artist_meta = lookup[0]
+        except LidarrError:
+            pass
+
+        mb_albums = await self._fetch_musicbrainz_release_groups(foreign_artist_id, artist_meta)
+        if mb_albums:
+            return mb_albums
+
+        artist_name = str(artist_meta.get("artistName") or "").strip()
+        if not artist_name:
+            return []
+        candidates = await self.lookup_album(artist_name)
+        return [
+            album
+            for album in candidates
+            if isinstance(album.get("artist"), dict)
+            and album["artist"].get("foreignArtistId") == foreign_artist_id
+        ]
+
+    async def _fetch_musicbrainz_release_groups(
+        self,
+        foreign_artist_id: str,
+        artist_meta: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """
+        Fetch release-groups for an artist MBID from MusicBrainz in Lidarr-compatible format.
+
+        :param foreign_artist_id: MusicBrainz artist UUID.
+        :param artist_meta: Artist metadata dict attached to each returned album.
+        """
+        url = "https://musicbrainz.org/ws/2/release-group"
+        params = {
+            "artist": foreign_artist_id,
+            "type": "album|ep|single",
+            "fmt": "json",
+            "limit": "100",
+        }
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "MusicAssistant-Lidarr/0.1 (https://github.com/Pi0up/ma-lidarr-provider)",
+        }
+        try:
+            async with self._session.get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=self._timeout,
+            ) as response:
+                if response.status != 200:
+                    return []
+                payload = await response.json()
+        except aiohttp.ClientError, TimeoutError:
+            return []
+
+        raw_groups = payload.get("release-groups", []) if isinstance(payload, dict) else []
+        albums: list[dict[str, Any]] = []
+        for group in raw_groups:
+            if not isinstance(group, dict):
+                continue
+            rg_id = group.get("id")
+            title = group.get("title")
+            if not isinstance(rg_id, str) or not isinstance(title, str):
+                continue
+            primary_type = str(group.get("primary-type") or "Album")
+            secondary = group.get("secondary-types")
+            if isinstance(secondary, list) and secondary:
+                album_type = str(secondary[0])
+            else:
+                album_type = primary_type
+            albums.append(
+                {
+                    "foreignAlbumId": rg_id,
+                    "title": title,
+                    "albumType": album_type,
+                    "releaseDate": group.get("first-release-date") or "",
+                    "artist": artist_meta,
+                    "images": [
+                        {
+                            "coverType": "cover",
+                            "remoteUrl": f"https://coverartarchive.org/release-group/{rg_id}/front-500",
+                        }
+                    ],
+                }
+            )
+        return albums
+
     async def get_artist_by_id(self, artist_id: int) -> dict[str, Any] | None:
         """
         Return the existing Lidarr artist by internal Lidarr ID, or None.
