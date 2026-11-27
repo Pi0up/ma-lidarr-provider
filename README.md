@@ -46,21 +46,15 @@ Vérifiez dans les logs que le serveur démarre sur le port `8095` et charge le 
 3. **Étape 1 (Identifiants)** : renseignez l'**URL Lidarr** (ex. `http://192.168.1.50:8686`) et la **clé API** (*Lidarr → Settings → General → Security*).
 4. **Étape 2 (Profils)** : sélectionnez votre *Root Folder*, *Quality Profile*, *Metadata Profile*, mode de monitoring artiste et tag Lidarr optionnel, puis validez.
 
-### 4. Connecter Home Assistant
 
-1. Si l'ancien add-on Music Assistant tourne encore sur Home Assistant, arrêtez-le (ou supprimez-le après avoir vérifié que votre nouvelle instance fonctionne).
-2. Dans Home Assistant : **Paramètres → Appareils et services → Ajouter une intégration → Music Assistant**.
-3. Indiquez l'URL de votre conteneur : `http://<IP_DU_SERVEUR>:8095`.
-4. Home Assistant retrouvera automatiquement vos lecteurs (`media_player.*`) et affichera l'interface Music Assistant dans la barre latérale.
-
-### 5. Mettre à jour le plugin
+### Mise à jour
 
 ```bash
 git pull
 docker compose restart music-assistant-server
 ```
 
-## Développement & Tests locaux
+## Développement & Tests
 
 ```bash
 # Installer l'environnement (Python 3.14 + music-assistant)
