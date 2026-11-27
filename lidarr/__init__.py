@@ -20,6 +20,7 @@ from music_assistant_models.config_entries import (
 )
 from music_assistant_models.enums import (
     ConfigEntryType,
+    ExternalID,
     MediaType,
     ProviderFeature,
 )
@@ -86,6 +87,7 @@ if TYPE_CHECKING:
     from music_assistant.models import ProviderInstanceType
 
 SUPPORTED_FEATURES = {
+    ProviderFeature.ALBUM_BY_EXTERNAL_ID,
     ProviderFeature.ARTIST_ALBUMS,
     ProviderFeature.BROWSE,
     ProviderFeature.SEARCH,
@@ -482,6 +484,53 @@ class LidarrProvider(MusicProvider):
             if parsed is not None:
                 return parsed
         raise MediaNotFoundError(f"Album {prov_album_id} not found in Lidarr")
+
+    async def get_album_by_external_id(
+        self, external_id: str, external_id_type: ExternalID
+    ) -> Album | None:
+        """
+        Resolve an album from MusicBrainz (release-group, release, or barcode) into a Lidarr album.
+
+        Enables right-click "Add to library" on albums shown in the "from MusicBrainz" artist
+        discography section in Music Assistant.
+
+        :param external_id: External identifier value.
+        :param external_id_type: External identifier type.
+        """
+        rg_id: str | None = None
+        if external_id_type == ExternalID.MB_RELEASEGROUP:
+            rg_id = external_id
+        elif external_id_type in (ExternalID.BARCODE, ExternalID.MB_ALBUM):
+            musicbrainz: Any = self.mass.get_provider("musicbrainz")
+            if musicbrainz is None:
+                return None
+            try:
+                if external_id_type == ExternalID.MB_ALBUM:
+                    release = await musicbrainz.get_release_details(external_id)
+                    rg = getattr(release, "release_group", None)
+                    rg_id = getattr(rg, "id", None)
+                else:
+                    releases = await musicbrainz.get_releases_by_barcode(external_id)
+                    for release in releases:
+                        rg = getattr(release, "release_group", None)
+                        if found_id := getattr(rg, "id", None):
+                            rg_id = str(found_id)
+                            break
+            except Exception as err:  # noqa: BLE001
+                self.logger.debug(
+                    "MusicBrainz resolution failed for %s=%s: %s",
+                    external_id_type.value,
+                    external_id,
+                    err,
+                )
+                return None
+
+        if not rg_id:
+            return None
+        try:
+            return await self.get_album(rg_id)
+        except MediaNotFoundError:
+            return None
 
     async def get_album_tracks(
         self,

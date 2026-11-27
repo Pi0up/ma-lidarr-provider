@@ -378,3 +378,38 @@ async def test_get_artist_albums_returns_discography(
     assert albums[0].name == "Discovery"
     assert albums[0].version == "Lidarr Request"
     assert albums[0].item_id == ALBUM_MBID
+
+
+async def test_get_album_by_external_id_resolves_musicbrainz_barcode(
+    mass: MusicAssistant,
+    aiohttp_server: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Albums from MusicBrainz discography resolve via barcode/MBID into Lidarr albums."""
+    state = FakeLidarrState()
+    server: TestServer = await aiohttp_server(build_fake_lidarr_app(state))
+    provider = await _setup_lidarr_provider(mass, server)
+
+    # Direct release-group resolution
+    direct = await provider.get_album_by_external_id(ALBUM_MBID, ExternalID.MB_RELEASEGROUP)
+    assert direct is not None
+    assert direct.name == "Discovery"
+    assert direct.item_id == ALBUM_MBID
+
+    # Barcode resolution via MusicBrainz provider (used by MA's "from MusicBrainz" discography)
+    fake_mb = SimpleNamespace(
+        get_releases_by_barcode=AsyncMock(
+            return_value=[SimpleNamespace(release_group=SimpleNamespace(id=ALBUM_MBID))]
+        )
+    )
+    orig_get_provider = mass.get_provider
+    monkeypatch.setattr(
+        mass,
+        "get_provider",
+        lambda pid: fake_mb if pid == "musicbrainz" else orig_get_provider(pid),
+    )
+
+    by_barcode = await provider.get_album_by_external_id("724384960629", ExternalID.BARCODE)
+    assert by_barcode is not None
+    assert by_barcode.name == "Discovery"
+    assert by_barcode.version == "Lidarr Request"
