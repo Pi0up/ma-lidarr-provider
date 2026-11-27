@@ -350,6 +350,8 @@ class LidarrClient:
                 "eventType": LIDARR_EVENT_TRACK_IMPORTED,
                 "sortKey": "date",
                 "sortDirection": "descending",
+                "includeArtist": "true",
+                "includeAlbum": "true",
             },
         )
         if isinstance(data, dict):

@@ -341,6 +341,8 @@ class LidarrProvider(MusicProvider):
             await self._seed_last_import_id()
             self._poll_task = self.mass.create_task(self._poll_imports())
 
+        self.mass.create_task(self._cleanup_completed_requests())
+
     @override
     async def unload(self, is_removed: bool = False) -> None:
         """Stop background import polling when the provider is unloaded."""
@@ -835,6 +837,26 @@ class LidarrProvider(MusicProvider):
         finally:
             self._completing_ids.discard(item_id)
 
+    async def _cleanup_completed_requests(self) -> None:
+        """Remove any Lidarr request placeholders in the MA library already imported in Lidarr."""
+        for media_type, controller in (
+            (MediaType.ALBUM, self.mass.music.albums),
+            (MediaType.ARTIST, self.mass.music.artists),
+        ):
+            try:
+                items = await controller.library_items(provider=self.instance_id, summary=False)
+            except Exception as err:  # noqa: BLE001
+                self.logger.debug("Skipping Lidarr library cleanup for %s: %s", media_type, err)
+                continue
+            for item in items:
+                if not hasattr(item, "provider_mappings"):
+                    continue
+                for mapping in item.provider_mappings:
+                    if mapping.provider_instance != self.instance_id:
+                        continue
+                    if await self._is_item_available_in_lidarr(mapping.item_id, media_type):
+                        await self._remove_request_from_library(mapping.item_id, media_type)
+
     async def _poll_imports(self) -> None:
         """Periodically poll Lidarr history and trigger a local MA rescan on new imports."""
         while True:
@@ -854,22 +876,8 @@ class LidarrProvider(MusicProvider):
                 self._last_import_id = latest_int
                 continue
             if latest_int > self._last_import_id:
-                new_imports = [
-                    rec
-                    for rec in imports
-                    if isinstance(rec, dict)
-                    and rec.get("id") is not None
-                    and int(rec["id"]) > self._last_import_id
-                ]
                 self._last_import_id = latest_int
-                for rec in new_imports:
-                    raw_album = rec.get("album")
-                    if isinstance(raw_album, dict) and isinstance(
-                        raw_album.get("foreignAlbumId"), str
-                    ):
-                        await self._remove_request_from_library(
-                            raw_album["foreignAlbumId"], MediaType.ALBUM
-                        )
+                await self._cleanup_completed_requests()
                 await self._trigger_local_rescan()
 
     async def _scan_subsonic_providers(self, target_ids: list[str]) -> None:

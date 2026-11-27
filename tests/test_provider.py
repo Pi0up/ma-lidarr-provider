@@ -297,3 +297,49 @@ async def test_request_tracking_progress_cleanup_and_navidrome_sync(
     fake_conn.start_scan.assert_awaited_once()
     fake_conn.get_scan_status.assert_awaited_once()
     mock_start_sync.assert_awaited_once_with(providers=["opensubsonic--navidrome"])
+
+
+async def test_cleanup_completed_requests_removes_imported_placeholders(
+    mass: MusicAssistant,
+    aiohttp_server: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Startup/poll cleanup removes MA library Lidarr placeholders already imported in Lidarr."""
+    state = FakeLidarrState()
+    state.albums.append(
+        {
+            "id": 42,
+            "artistId": 10,
+            "foreignAlbumId": ALBUM_MBID,
+            "title": "Discovery",
+            "monitored": True,
+            "statistics": {"trackFileCount": 14, "percentOfTracks": 100.0},
+        }
+    )
+    server: TestServer = await aiohttp_server(build_fake_lidarr_app(state))
+    provider = await _setup_lidarr_provider(mass, server)
+    lidarr_prov: Any = provider
+
+    fake_placeholder = SimpleNamespace(
+        item_id="55",
+        name="Discovery",
+        provider_mappings=[
+            SimpleNamespace(provider_instance=provider.instance_id, item_id=ALBUM_MBID)
+        ],
+    )
+    monkeypatch.setattr(
+        mass.music.albums,
+        "library_items",
+        AsyncMock(return_value=[fake_placeholder]),
+    )
+    monkeypatch.setattr(mass.music.artists, "library_items", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        mass.music.albums,
+        "get_library_item_by_prov_id",
+        AsyncMock(return_value=fake_placeholder),
+    )
+    mock_remove = AsyncMock()
+    monkeypatch.setattr(mass.music.albums, "remove_item_from_library", mock_remove)
+
+    await lidarr_prov._cleanup_completed_requests()  # noqa: SLF001
+    mock_remove.assert_awaited_once_with("55", recursive=False)
