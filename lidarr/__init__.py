@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, override
+from typing import TYPE_CHECKING, Any, override
 
 from music_assistant_models.config_entries import (
     ConfigEntry,
@@ -67,6 +67,10 @@ from .constants import (
     DEFAULT_ARTIST_MONITOR,
     DEFAULT_POLL_INTERVAL,
     DEFAULT_VERSION_TAG,
+    REQUEST_MAX_WAIT_SECONDS,
+    REQUEST_POLL_INTERVAL,
+    SUBSONIC_SCAN_MAX_WAIT_SECONDS,
+    SUBSONIC_SCAN_POLL_INTERVAL,
     SYNC_PROVIDER_AUTO,
     SYNC_PROVIDER_NONE,
     TAG_NONE,
@@ -461,6 +465,7 @@ class LidarrProvider(MusicProvider):
                 self.logger.exception("Failed to request album %s in Lidarr", item.name)
                 return False
             self.logger.info("Requested album %r (%s) in Lidarr", item.name, item.item_id)
+            self._start_request_tracker(item.item_id, item.name, MediaType.ALBUM)
             return True
 
         if item.media_type == MediaType.ARTIST:
@@ -472,6 +477,7 @@ class LidarrProvider(MusicProvider):
                 self.logger.exception("Failed to request artist %s in Lidarr", item.name)
                 return False
             self.logger.info("Requested artist %r (%s) in Lidarr", item.name, item.item_id)
+            self._start_request_tracker(item.item_id, item.name, MediaType.ARTIST)
             return True
 
         return False
@@ -610,6 +616,179 @@ class LidarrProvider(MusicProvider):
         if imports and isinstance(imports[0], dict) and imports[0].get("id") is not None:
             self._last_import_id = int(imports[0]["id"])
 
+    def _start_request_tracker(
+        self,
+        item_id: str,
+        item_name: str,
+        media_type: MediaType,
+    ) -> None:
+        """
+        Launch a Music Assistant background task that tracks a Lidarr request until completion.
+
+        :param item_id: MusicBrainz album or artist UUID.
+        :param item_name: Human-readable title displayed in the MA tasks panel.
+        :param media_type: ``MediaType.ALBUM`` or ``MediaType.ARTIST``.
+        """
+        task_id = f"lidarr_request_{media_type.value}_{item_id}"
+
+        async def _runner() -> None:
+            await self._track_request_until_available(item_id, item_name, media_type)
+
+        self.mass.tasks.run_background_task(
+            name=f"Lidarr: {item_name}",
+            handler=_runner,
+            task_id=task_id,
+            allow_cancel=True,
+        )
+
+    async def _track_request_until_available(
+        self,
+        item_id: str,
+        item_name: str,
+        media_type: MediaType,
+        *,
+        poll_interval: float = REQUEST_POLL_INTERVAL,
+        max_wait: float = REQUEST_MAX_WAIT_SECONDS,
+    ) -> None:
+        """
+        Poll Lidarr queue and library status, update MA task progress, then clean up and sync.
+
+        :param item_id: MusicBrainz album or artist UUID.
+        :param item_name: Display name of the requested album or artist.
+        :param media_type: ``MediaType.ALBUM`` or ``MediaType.ARTIST``.
+        :param poll_interval: Seconds between Lidarr status checks.
+        :param max_wait: Maximum seconds to wait before timing out.
+        """
+        self.mass.tasks.update_current_task_progress(5, f"Searching in Lidarr: {item_name}")
+        deadline = asyncio.get_running_loop().time() + max_wait
+
+        while asyncio.get_running_loop().time() < deadline:
+            if await self._is_item_available_in_lidarr(item_id, media_type):
+                self.mass.tasks.update_current_task_progress(
+                    90, "Imported in Lidarr — removing request"
+                )
+                await self._remove_request_from_library(item_id, media_type)
+                self.mass.tasks.update_current_task_progress(
+                    95, "Scanning Navidrome & syncing Music Assistant"
+                )
+                await self._trigger_local_rescan()
+                self.mass.tasks.update_current_task_progress(100, "Available in library")
+                return
+
+            queue_progress = await self._find_queue_progress(item_id, media_type)
+            if queue_progress is not None:
+                pct, status = queue_progress
+                # Map 0..100 download progress into 10..85 overall task progress.
+                task_pct = 10 + round(pct * 0.75)
+                self.mass.tasks.update_current_task_progress(task_pct, f"Lidarr: {status} ({pct}%)")
+            else:
+                self.mass.tasks.update_current_task_progress(
+                    8, f"Waiting for download in Lidarr: {item_name}"
+                )
+
+            await asyncio.sleep(poll_interval)
+
+        self.logger.warning(
+            "Timed out waiting for Lidarr import of %s (%s) after %ss",
+            item_name,
+            item_id,
+            max_wait,
+        )
+
+    async def _is_item_available_in_lidarr(self, item_id: str, media_type: MediaType) -> bool:
+        """
+        Return True once the requested album or artist has imported tracks in Lidarr.
+
+        :param item_id: MusicBrainz album or artist UUID.
+        :param media_type: ``MediaType.ALBUM`` or ``MediaType.ARTIST``.
+        """
+        available = False
+        try:
+            if media_type == MediaType.ALBUM:
+                albums = await self.client.get_albums(foreign_album_id=item_id)
+                stats = albums[0].get("statistics") if albums else None
+                if isinstance(stats, dict):
+                    track_files = int(stats.get("trackFileCount") or 0)
+                    pct = float(stats.get("percentOfTracks") or 0)
+                    available = track_files > 0 and pct >= 100.0
+            elif media_type == MediaType.ARTIST:
+                artist = await self.client.get_artist_by_foreign_id(item_id)
+                stats = artist.get("statistics") if artist is not None else None
+                if isinstance(stats, dict):
+                    available = int(stats.get("trackFileCount") or 0) > 0
+        except LidarrError as err:
+            self.logger.debug("Lidarr availability check failed for %s: %s", item_id, err)
+        return available
+
+    async def _find_queue_progress(
+        self, item_id: str, media_type: MediaType
+    ) -> tuple[int, str] | None:
+        """
+        Return ``(percent, status)`` if the item is currently in the Lidarr download queue.
+
+        :param item_id: MusicBrainz album or artist UUID.
+        :param media_type: ``MediaType.ALBUM`` or ``MediaType.ARTIST``.
+        """
+        try:
+            records = await self.client.get_queue()
+        except LidarrError:
+            return None
+
+        for record in records:
+            raw_album = record.get("album")
+            raw_artist = record.get("artist")
+            matched = (
+                media_type == MediaType.ALBUM
+                and isinstance(raw_album, dict)
+                and raw_album.get("foreignAlbumId") == item_id
+            ) or (
+                media_type == MediaType.ARTIST
+                and isinstance(raw_artist, dict)
+                and raw_artist.get("foreignArtistId") == item_id
+            )
+            if not matched:
+                continue
+            status = str(record.get("status", "downloading")).lower()
+            size = float(record.get("size") or 0)
+            sizeleft = float(record.get("sizeleft") or 0)
+            pct = max(0, min(100, round((1.0 - sizeleft / size) * 100))) if size > 0 else 0
+            return pct, status
+        return None
+
+    async def _remove_request_from_library(self, item_id: str, media_type: MediaType) -> None:
+        """
+        Remove the Lidarr request placeholder from the Music Assistant library.
+
+        If the item is already merged with another provider (e.g. Navidrome), only the Lidarr
+        provider mapping is removed. Otherwise the placeholder library item itself is removed.
+
+        :param item_id: MusicBrainz album or artist UUID.
+        :param media_type: ``MediaType.ALBUM`` or ``MediaType.ARTIST``.
+        """
+        controller: Any
+        if media_type == MediaType.ALBUM:
+            controller = self.mass.music.albums
+        elif media_type == MediaType.ARTIST:
+            controller = self.mass.music.artists
+        else:
+            return
+
+        lib_item = await controller.get_library_item_by_prov_id(item_id, self.instance_id)
+        if lib_item is None:
+            return
+
+        other_mappings = [
+            mapping
+            for mapping in lib_item.provider_mappings
+            if mapping.provider_instance != self.instance_id
+        ]
+        if other_mappings:
+            await controller.remove_provider_mappings(lib_item.item_id, self.instance_id)
+            self.logger.info("Removed Lidarr mapping from library item %r", lib_item.name)
+        else:
+            await controller.remove_item_from_library(lib_item.item_id, recursive=False)
+            self.logger.info("Removed completed Lidarr request %r from library", lib_item.name)
+
     async def _poll_imports(self) -> None:
         """Periodically poll Lidarr history and trigger a local MA rescan on new imports."""
         while True:
@@ -629,11 +808,58 @@ class LidarrProvider(MusicProvider):
                 self._last_import_id = latest_int
                 continue
             if latest_int > self._last_import_id:
+                new_imports = [
+                    rec
+                    for rec in imports
+                    if isinstance(rec, dict)
+                    and rec.get("id") is not None
+                    and int(rec["id"]) > self._last_import_id
+                ]
                 self._last_import_id = latest_int
+                for rec in new_imports:
+                    raw_album = rec.get("album")
+                    if isinstance(raw_album, dict) and isinstance(
+                        raw_album.get("foreignAlbumId"), str
+                    ):
+                        await self._remove_request_from_library(
+                            raw_album["foreignAlbumId"], MediaType.ALBUM
+                        )
                 await self._trigger_local_rescan()
 
+    async def _scan_subsonic_providers(self, target_ids: list[str]) -> None:
+        """
+        Trigger a library scan on any target OpenSubsonic/Navidrome provider and wait for it.
+
+        :param target_ids: Provider instance IDs about to be synced in Music Assistant.
+        """
+        for instance_id in target_ids:
+            prov = self.mass.get_provider(instance_id)
+            conn = getattr(prov, "conn", None)
+            if conn is None or not hasattr(conn, "start_scan"):
+                continue
+            try:
+                self.logger.info(
+                    "Triggering remote library scan on %s (Navidrome/OpenSubsonic)",
+                    instance_id,
+                )
+                status = await conn.start_scan()
+                if not hasattr(conn, "get_scan_status"):
+                    continue
+                deadline = asyncio.get_running_loop().time() + SUBSONIC_SCAN_MAX_WAIT_SECONDS
+                while getattr(status, "scanning", False) and (
+                    asyncio.get_running_loop().time() < deadline
+                ):
+                    await asyncio.sleep(SUBSONIC_SCAN_POLL_INTERVAL)
+                    status = await conn.get_scan_status()
+            except Exception as err:  # noqa: BLE001
+                self.logger.warning(
+                    "Remote Subsonic/Navidrome scan failed on %s: %s",
+                    instance_id,
+                    err,
+                )
+
     async def _trigger_local_rescan(self) -> None:
-        """Trigger a library sync on the configured local Music Assistant provider(s)."""
+        """Scan Navidrome/OpenSubsonic (if present) and trigger Music Assistant library sync."""
         if self._sync_provider == SYNC_PROVIDER_NONE:
             return
         if self._sync_provider == SYNC_PROVIDER_AUTO:
@@ -647,6 +873,7 @@ class LidarrProvider(MusicProvider):
 
         if not targets:
             return
+        await self._scan_subsonic_providers(targets)
         self.logger.info(
             "Lidarr imported new audio; triggering Music Assistant rescan for %s",
             targets,

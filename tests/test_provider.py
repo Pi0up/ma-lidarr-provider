@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock
 
@@ -191,3 +192,99 @@ async def test_trigger_local_rescan_calls_start_sync(
 
     await lidarr_prov._trigger_local_rescan()  # noqa: SLF001
     mock_start_sync.assert_awaited_once_with(providers=["filesystem_local"])
+
+
+async def test_request_tracking_progress_cleanup_and_navidrome_sync(
+    mass: MusicAssistant,
+    aiohttp_server: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tracking a request reports progress, removes the MA request, scans Navidrome and syncs MA."""
+    state = FakeLidarrState()
+    state.queue_records.append(
+        {
+            "status": "downloading",
+            "size": 100.0,
+            "sizeleft": 50.0,
+            "artist": {"foreignArtistId": ARTIST_MBID, "artistName": "Daft Punk"},
+            "album": {
+                "foreignAlbumId": ALBUM_MBID,
+                "title": "Discovery",
+                "albumType": "Album",
+                "releaseDate": "2001-03-12T00:00:00Z",
+            },
+        }
+    )
+    server: TestServer = await aiohttp_server(build_fake_lidarr_app(state))
+    provider = await _setup_lidarr_provider(mass, server)
+    lidarr_prov: Any = provider
+
+    progress_updates: list[tuple[int | None, str | None]] = []
+
+    def record_progress(progress: int | None, text: str | None = None) -> None:
+        progress_updates.append((progress, text))
+        # On the first queue progress tick, mark the album as imported in Lidarr.
+        if progress == 48:
+            state.queue_records.clear()
+            state.albums.append(
+                {
+                    "id": 42,
+                    "artistId": 10,
+                    "foreignAlbumId": ALBUM_MBID,
+                    "title": "Discovery",
+                    "monitored": True,
+                    "statistics": {"trackFileCount": 14, "percentOfTracks": 100.0},
+                }
+            )
+
+    monkeypatch.setattr(mass.tasks, "update_current_task_progress", record_progress)
+
+    # Simulate a placeholder Lidarr album present in the MA library.
+    fake_lib_item = SimpleNamespace(
+        item_id="99",
+        name="Discovery",
+        provider_mappings=[SimpleNamespace(provider_instance=provider.instance_id)],
+    )
+    monkeypatch.setattr(
+        mass.music.albums,
+        "get_library_item_by_prov_id",
+        AsyncMock(return_value=fake_lib_item),
+    )
+    mock_remove = AsyncMock()
+    monkeypatch.setattr(mass.music.albums, "remove_item_from_library", mock_remove)
+
+    # Simulate an OpenSubsonic/Navidrome provider targeted for rescan.
+    fake_conn = SimpleNamespace(
+        start_scan=AsyncMock(return_value=SimpleNamespace(scanning=True)),
+        get_scan_status=AsyncMock(return_value=SimpleNamespace(scanning=False)),
+    )
+    fake_navidrome = SimpleNamespace(
+        instance_id="opensubsonic--navidrome",
+        domain="opensubsonic",
+        is_streaming_provider=False,
+        conn=fake_conn,
+    )
+    orig_get_provider = mass.get_provider
+    monkeypatch.setattr(
+        mass,
+        "get_provider",
+        lambda pid: fake_navidrome if pid == "opensubsonic--navidrome" else orig_get_provider(pid),
+    )
+    mock_start_sync = AsyncMock()
+    monkeypatch.setattr(mass.music, "start_sync", mock_start_sync)
+    lidarr_prov._sync_provider = "opensubsonic--navidrome"  # noqa: SLF001
+
+    await lidarr_prov._track_request_until_available(  # noqa: SLF001
+        ALBUM_MBID,
+        "Discovery",
+        MediaType.ALBUM,
+        poll_interval=0.01,
+        max_wait=5.0,
+    )
+
+    assert any(pct == 48 and text and "50%" in text for pct, text in progress_updates)
+    assert progress_updates[-1] == (100, "Available in library")
+    mock_remove.assert_awaited_once_with("99", recursive=False)
+    fake_conn.start_scan.assert_awaited_once()
+    fake_conn.get_scan_status.assert_awaited_once()
+    mock_start_sync.assert_awaited_once_with(providers=["opensubsonic--navidrome"])
